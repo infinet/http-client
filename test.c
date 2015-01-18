@@ -13,7 +13,7 @@ void test_http_get(void)
     if (ret == -1)
         printf("http_get error\n");
     else
-        printf("Get %s\n--- content ---\n%s\n", url, buf);
+        printf("Get %s\n--- HTTP %d, content ---\n%s\n", url, ret, buf);
 
     free(buf);
 }

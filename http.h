@@ -16,7 +16,8 @@
 #define MAX_HEADER_SIZE 4 * 1024
 #define HTTP_BUFSIZE 16 * 1024
 #define CHUNK 16 * 1024  /* zlib inflate buf chunk, can be as small as 1 */
-
+#define STATUS_BUF 32
+#define REDIRECT_LIMIT 5
 
 struct request {
     const char *method;

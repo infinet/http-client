@@ -11,8 +11,6 @@ See test.c for example. Don't forget to free() the buffer.
 ## Limitations
 
 * Only support HTTP GET
-* Does not support redirect
-* No http status code report except return -1 on error
 * No https
 
 

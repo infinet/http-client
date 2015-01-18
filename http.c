@@ -22,12 +22,14 @@ static char host[MAXURL];
 static char arg[MAXURL];
 static char request_string[MAXURL + 4096];
 
+static void parse_url(char *url);
+static size_t create_req_str(struct request *req);
 static struct request *request_new(const char *method, char *arg);
 static int request_set_header(struct request *req, const char *name, char *value);
-static int request_send(const struct request *req, int fd);
+static int request_send(char *method, char *host, char *arg);
 static void request_free (struct request *req);
 
-static struct resp_headers *parse_header(char *header);
+static int parse_header(struct resp_headers *resp, char *head);
 static char *read_drain_headers(int sockfd);
 static char *response_head_strdup(struct resp_headers *resp, char *name);
 static unsigned char *read_response_body(int sockfd);
@@ -36,15 +38,88 @@ static int is_gzip(struct resp_headers *resp);
 static void response_free(struct resp_headers *resp);
 
 
+/* return http status code on success, -1 on error */
 int http_get(char *url, char **out)
 {
-    struct request *req;
     struct resp_headers *header;
-    char *head;  // will be freed by response_free
-    char *p;
+    char *hbuf;  // will be freed by response_free
+    char *red_url;
+    unsigned char *buf;
     int sockfd;
+    int status;
+    int red_count = 0;
 
-    p = strstr(url, "://");
+    parse_url(url);
+    if ((sockfd = request_send("GET", host, arg)) == -1) {
+        fprintf(stderr, "http_get %s: fail send request\n", url);
+        return -1;
+    }
+
+    if ((hbuf = read_drain_headers(sockfd)) == NULL) {
+        fprintf(stderr, "http_get %s: fail to read response header\n", url);
+        return -1;
+    }
+
+    header = calloc(1, sizeof(struct resp_headers));
+    if ((status = parse_header(header, hbuf)) == -1) {
+        fprintf(stderr, "http_get %s%s: fail to parse response header\n",
+                host, arg);
+        return -1;
+    }
+
+    while (300 < status && status < 400 && red_count++ < REDIRECT_LIMIT) {
+        printf("HTTP %d: redirect to %s%s\n", status, host, arg);
+        red_url = response_head_strdup(header, "Location");
+        response_free(header);
+        if (red_url[0] == '/')
+            strncpy(arg, red_url, MAXURL);
+        else
+            parse_url(red_url);
+
+        free(red_url);
+        close(sockfd);
+        if ((sockfd = request_send("GET", host, arg)) == -1) {
+            fprintf(stderr, "http_get %s: fail send request\n", url);
+            return -1;
+        }
+
+        if ((hbuf = read_drain_headers(sockfd)) == NULL) {
+            fprintf(stderr, "http_get %s: fail to read response header\n", url);
+            return -1;
+        }
+
+        header = calloc(1, sizeof(struct resp_headers));
+        if ((status = parse_header(header, hbuf)) == -1) {
+            fprintf(stderr, "http_get %s%s: fail to parse response header\n",
+                    host, arg);
+            return -1;
+        }
+    }
+
+    if (is_gzip(header))
+        buf = read_response_body_gzip(sockfd);
+    else
+        buf = read_response_body(sockfd);
+
+    response_free(header);
+    close(sockfd);
+
+    if (buf == NULL) {
+        fprintf(stderr, "http_get %s: fail to read response body\n", url);
+        return -1;
+    }
+
+    *out = (char *) buf;
+    return status;
+}
+
+
+/* parse url and save to global string buffer host & arg * */
+void parse_url(char *url)
+{
+    char *p;
+
+    p = strstr(url, ":/");
     if (p == NULL) {
         strcpy(host, url);
     } else {
@@ -60,51 +135,6 @@ int http_get(char *url, char **out)
         strcpy(arg, p);
         *p = '\0';  // end host
     }
-
-    if ((sockfd = tcp_connect(host, "80")) < 0) {
-        fprintf(stderr, "http_get %s: can not create connection\n", url);
-        return -1;
-    }
-
-    req = request_new("GET", arg);
-    request_set_header(req, "Host", host);
-    request_set_header(req, "Accept-Encoding", "gzip");
-    request_set_header(req, "User-Agent", DEFAULT_USER_AGENT);
-
-    if (request_send(req, sockfd) == -1) {
-        fprintf(stderr, "http_get %s: fail send request\n", url);
-        request_free(req);
-        return -1;
-    }
-
-    request_free(req);
-
-    if ((head = read_drain_headers(sockfd)) == NULL) {
-        fprintf(stderr, "http_get %s: fail to read response header\n", url);
-        return -1;
-    }
-
-    if ((header = parse_header(head)) == NULL) {
-        fprintf(stderr, "http_get %s: fail to parse response header\n", url);
-        return -1;
-    }
-
-    unsigned char *buf;
-    if (is_gzip(header))
-        buf = read_response_body_gzip(sockfd);
-    else
-        buf = read_response_body(sockfd);
-
-    response_free(header);
-    close(sockfd);
-
-    if (buf == NULL) {
-        fprintf(stderr, "http_get %s: fail to read response body\n", url);
-        return -1;
-    }
-
-    *out = (char *) buf;
-    return 0;
 }
 
 
@@ -170,12 +200,12 @@ static int request_set_header(struct request *req, const char *name, char *value
 }
 
 
-static int request_send(const struct request *req, int fd)
+static size_t create_req_str(struct request *req)
 {
     struct request_header *hdr;
     char *p;
     size_t size = 0;
-    int i, rc;
+    int i;
 
     /* GET /urlpath HTTP/1.0 \r\n */
     size += strlen(req->method) + 1;
@@ -201,10 +231,35 @@ static int request_send(const struct request *req, int fd)
     }
 
     strcat(p, "\r\n");
-    rc = writen(fd, request_string, size);
-    if (rc == -1)
+    return size;
+}
+
+/* open connect and send request, return a socket fd */
+static int request_send(char *method, char *host, char *arg)
+{
+    struct request *req;
+    size_t size;
+    int sockfd;
+
+    if ((sockfd = tcp_connect(host, "80")) < 0) {
+        fprintf(stderr, "http_get: can not create connection to %s\n", host);
         return -1;
-    return 0;
+    }
+
+    req = request_new(method, arg);
+    request_set_header(req, "Host", host);
+    request_set_header(req, "Accept-Encoding", "gzip");
+    request_set_header(req, "User-Agent", DEFAULT_USER_AGENT);
+
+    size = create_req_str(req);
+    if (writen(sockfd, request_string, size) == -1) {
+        fprintf(stderr, "http_get: fail send request to %s\n", host);
+        request_free(req);
+        return -1;
+    }
+
+    request_free(req);
+    return sockfd;
 }
 
 
@@ -257,23 +312,23 @@ static char *read_drain_headers(int fd)
 }
 
 
-/* parse response header, return NULL on error */
-static struct resp_headers *parse_header(char *head)
+/* parse response header, return http status code , -1 on error */
+static int parse_header(struct resp_headers *resp, char *head)
 {
-    struct resp_headers *resp;
     char **np;
-    char *p;
+    char *p, *s;
+    char status_buf[STATUS_BUF];
+    int status;
 
-    p = head;
-    resp = calloc(1, sizeof(struct resp_headers));
-    resp->data = p;
+    resp->data = head;
     resp->hcount = 0;
     resp->hlimit = 16;
     resp->headers = malloc(resp->hlimit * sizeof(char **));
     memset(resp->headers, 0, resp->hlimit * sizeof(char **));
 
-    resp->headers[resp->hcount++] = p;
+    resp->headers[resp->hcount++] = head;
     // header end with \r\n\0, the \r in the extra \r\n is overwritten by \0
+    p = head;
     for ( ; p[2] != '\0'; p++) {
         if (p[0] != '\r' && p[1] != '\n')
             continue;
@@ -285,7 +340,7 @@ static struct resp_headers *parse_header(char *head)
                 fprintf(stderr, "parse_header: realloc error\n");
                 free(resp->data);
                 free(resp->headers);
-                return NULL;
+                return -1;
             }
 
             resp->headers = np;
@@ -294,7 +349,14 @@ static struct resp_headers *parse_header(char *head)
         resp->headers[resp->hcount++] = p + 2;
     }
 
-    return resp;
+    strncpy(status_buf, head, STATUS_BUF);
+    s = strchr(status_buf, ' ');
+    s++;
+    p = strchr(s, ' ');
+    *p = '\0';
+    status = atoi(s);
+
+    return status;
 }
 
 
